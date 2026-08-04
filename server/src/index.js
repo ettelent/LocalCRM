@@ -11,81 +11,282 @@ const origins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://loca
 app.use(cors({ origin: origins }))
 app.use(express.json())
 
-const users = () => new Map([[process.env.LESHA_KEY, 'Lesha'], [process.env.DENIS_KEY, 'Denis']].filter(([key]) => key))
+const users = new Map([
+  [process.env.LESHA_KEY, 'Lesha'],
+  [process.env.DENIS_KEY, 'Denis'],
+].filter(([key]) => key))
+
+const notFound = (res, label = 'Запись') => res.status(404).json({ error: `${label} не найден` })
+const requiredText = (value, message) => {
+  if (!value || !String(value).trim()) throw new Error(message)
+  return String(value).trim()
+}
+const read = () => db.read()
+const save = (store) => db.write(store)
+const byId = (rows, id) => rows.find((item) => Number(item.id) === Number(id))
+const removeById = (rows, id) => {
+  const index = rows.findIndex((item) => Number(item.id) === Number(id))
+  if (index === -1) return false
+  rows.splice(index, 1)
+  return true
+}
+const safe = (handler) => (req, res) => {
+  try {
+    handler(req, res)
+  } catch (error) {
+    res.status(400).json({ error: error.message })
+  }
+}
+
 app.post('/api/auth/login', (req, res) => {
-  const name = users().get(req.body?.key)
-  if (!name) return res.status(401).json({ error: 'Неверный ключ доступа' })
-  res.json({ token: req.body.key, user: name })
+  const user = users.get(req.body?.key)
+  if (!user) return res.status(401).json({ error: 'Неверный ключ доступа' })
+  res.json({ token: req.body.key, user })
 })
+
 app.use('/api', (req, res, next) => {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
-  const user = users().get(token)
+  const user = users.get(token)
   if (!user) return res.status(401).json({ error: 'Требуется авторизация' })
   req.user = user
   next()
 })
 
-const one = (sql, value) => db.prepare(sql).get(value)
-const required = (res, value, label = 'Запись') => value || (res.status(404).json({ error: `${label} не найден` }), null)
-const safe = fn => (req, res) => { try { fn(req, res) } catch (e) { res.status(400).json({ error: e.message }) } }
-
 app.get('/api/me', (req, res) => res.json({ user: req.user }))
-app.get('/api/clients', (req, res) => res.json(db.prepare('SELECT * FROM clients ORDER BY id DESC').all()))
-app.get('/api/clients/:id', safe((req, res) => { const row = required(res, one('SELECT * FROM clients WHERE id=?', req.params.id), 'Клиент'); if (row) res.json(row) }))
+
+app.get('/api/clients', (req, res) => {
+  const store = read()
+  res.json([...store.clients].sort((a, b) => b.id - a.id))
+})
+
+app.get('/api/clients/:id', (req, res) => {
+  const store = read()
+  const client = byId(store.clients, req.params.id)
+  if (!client) return notFound(res, 'Клиент')
+  res.json(client)
+})
+
 app.post('/api/clients', safe((req, res) => {
-  if (!req.body.name?.trim()) throw new Error('Укажите имя клиента')
-  const info = db.prepare('INSERT INTO clients(name,contactInfo,notes) VALUES(?,?,?)').run(req.body.name.trim(), req.body.contactInfo || '', req.body.notes || '')
-  res.status(201).json(one('SELECT * FROM clients WHERE id=?', info.lastInsertRowid))
+  const store = read()
+  const client = {
+    id: db.nextId(store, 'clients'),
+    name: requiredText(req.body.name, 'Укажите имя клиента'),
+    contactInfo: req.body.contactInfo || '',
+    notes: req.body.notes || '',
+  }
+  store.clients.push(client)
+  save(store)
+  res.status(201).json(client)
 }))
+
 app.put('/api/clients/:id', safe((req, res) => {
-  if (!req.body.name?.trim()) throw new Error('Укажите имя клиента')
-  const info = db.prepare('UPDATE clients SET name=?,contactInfo=?,notes=? WHERE id=?').run(req.body.name.trim(), req.body.contactInfo || '', req.body.notes || '', req.params.id)
-  if (!info.changes) return res.status(404).json({ error: 'Клиент не найден' })
-  res.json(one('SELECT * FROM clients WHERE id=?', req.params.id))
+  const store = read()
+  const client = byId(store.clients, req.params.id)
+  if (!client) return notFound(res, 'Клиент')
+  client.name = requiredText(req.body.name ?? client.name, 'Укажите имя клиента')
+  client.contactInfo = req.body.contactInfo ?? client.contactInfo
+  client.notes = req.body.notes ?? client.notes
+  save(store)
+  res.json(client)
 }))
-app.delete('/api/clients/:id', (req, res) => { const x = db.prepare('DELETE FROM clients WHERE id=?').run(req.params.id); res.status(x.changes ? 204 : 404).end() })
+
+app.delete('/api/clients/:id', (req, res) => {
+  const store = read()
+  const ok = removeById(store.clients, req.params.id)
+  if (!ok) return notFound(res, 'Клиент')
+  store.projects = store.projects.filter((project) => Number(project.clientId) !== Number(req.params.id))
+  const projectIds = new Set(store.projects.map((project) => Number(project.id)))
+  store.tasks = store.tasks.filter((task) => projectIds.has(Number(task.projectId)))
+  const taskIds = new Set(store.tasks.map((task) => Number(task.id)))
+  store.todos = store.todos.filter((todo) => taskIds.has(Number(todo.taskId)))
+  store.messages = store.messages.filter((message) => taskIds.has(Number(message.taskId)))
+  save(store)
+  res.status(204).end()
+})
 
 app.get('/api/projects', (req, res) => {
-  const rows = req.query.clientId ? db.prepare('SELECT * FROM projects WHERE clientId=? ORDER BY id DESC').all(req.query.clientId) : db.prepare('SELECT * FROM projects ORDER BY id DESC').all()
-  res.json(rows)
+  const store = read()
+  const rows = req.query.clientId
+    ? store.projects.filter((project) => Number(project.clientId) === Number(req.query.clientId))
+    : store.projects
+  res.json([...rows].sort((a, b) => b.id - a.id))
 })
-app.get('/api/projects/:id', safe((req, res) => { const row = required(res, one('SELECT * FROM projects WHERE id=?', req.params.id), 'Проект'); if (row) res.json(row) }))
+
+app.get('/api/projects/:id', (req, res) => {
+  const store = read()
+  const project = byId(store.projects, req.params.id)
+  if (!project) return notFound(res, 'Проект')
+  res.json(project)
+})
+
 app.post('/api/projects', safe((req, res) => {
-  if (!req.body.title?.trim() || !req.body.clientId) throw new Error('Укажите клиента и название')
-  const info = db.prepare('INSERT INTO projects(clientId,title,description,status) VALUES(?,?,?,?)').run(req.body.clientId, req.body.title.trim(), req.body.description || '', req.body.status || 'active')
-  res.status(201).json(one('SELECT * FROM projects WHERE id=?', info.lastInsertRowid))
+  const store = read()
+  const project = {
+    id: db.nextId(store, 'projects'),
+    clientId: Number(req.body.clientId),
+    title: requiredText(req.body.title, 'Укажите клиента и название'),
+    description: req.body.description || '',
+    status: ['active', 'paused', 'done'].includes(req.body.status) ? req.body.status : 'active',
+    createdAt: new Date().toISOString(),
+  }
+  if (!project.clientId || !byId(store.clients, project.clientId)) throw new Error('Укажите существующего клиента')
+  store.projects.push(project)
+  save(store)
+  res.status(201).json(project)
 }))
+
 app.put('/api/projects/:id', safe((req, res) => {
-  const old = required(res, one('SELECT * FROM projects WHERE id=?', req.params.id), 'Проект'); if (!old) return
-  db.prepare('UPDATE projects SET clientId=?,title=?,description=?,status=? WHERE id=?').run(req.body.clientId ?? old.clientId, req.body.title ?? old.title, req.body.description ?? old.description, req.body.status ?? old.status, req.params.id)
-  res.json(one('SELECT * FROM projects WHERE id=?', req.params.id))
+  const store = read()
+  const project = byId(store.projects, req.params.id)
+  if (!project) return notFound(res, 'Проект')
+  if (req.body.clientId != null) {
+    const client = byId(store.clients, req.body.clientId)
+    if (!client) throw new Error('Укажите существующего клиента')
+    project.clientId = Number(req.body.clientId)
+  }
+  if (req.body.title != null) project.title = requiredText(req.body.title, 'Укажите название')
+  if (req.body.description != null) project.description = req.body.description
+  if (req.body.status != null) project.status = ['active', 'paused', 'done'].includes(req.body.status) ? req.body.status : project.status
+  save(store)
+  res.json(project)
 }))
-app.delete('/api/projects/:id', (req, res) => { const x = db.prepare('DELETE FROM projects WHERE id=?').run(req.params.id); res.status(x.changes ? 204 : 404).end() })
+
+app.delete('/api/projects/:id', (req, res) => {
+  const store = read()
+  const ok = removeById(store.projects, req.params.id)
+  if (!ok) return notFound(res, 'Проект')
+  const taskIds = new Set(store.tasks.filter((task) => Number(task.projectId) === Number(req.params.id)).map((task) => Number(task.id)))
+  store.tasks = store.tasks.filter((task) => Number(task.projectId) !== Number(req.params.id))
+  store.todos = store.todos.filter((todo) => !taskIds.has(Number(todo.taskId)))
+  store.messages = store.messages.filter((message) => !taskIds.has(Number(message.taskId)))
+  save(store)
+  res.status(204).end()
+})
 
 app.get('/api/tasks', (req, res) => {
-  const rows = req.query.projectId ? db.prepare('SELECT * FROM tasks WHERE projectId=? ORDER BY id DESC').all(req.query.projectId) : db.prepare('SELECT * FROM tasks ORDER BY id DESC').all()
-  res.json(rows)
+  const store = read()
+  const rows = req.query.projectId
+    ? store.tasks.filter((task) => Number(task.projectId) === Number(req.query.projectId))
+    : store.tasks
+  res.json([...rows].sort((a, b) => b.id - a.id))
 })
-app.get('/api/tasks/:id', safe((req, res) => { const row = required(res, one('SELECT * FROM tasks WHERE id=?', req.params.id), 'Задача'); if (row) res.json(row) }))
-app.post('/api/tasks', safe((req, res) => {
-  if (!req.body.title?.trim() || !req.body.projectId) throw new Error('Укажите проект и название')
-  const info = db.prepare('INSERT INTO tasks(projectId,title,description,status) VALUES(?,?,?,?)').run(req.body.projectId, req.body.title.trim(), req.body.description || '', req.body.status || 'active')
-  res.status(201).json(one('SELECT * FROM tasks WHERE id=?', info.lastInsertRowid))
-}))
-app.put('/api/tasks/:id', safe((req, res) => {
-  const old = required(res, one('SELECT * FROM tasks WHERE id=?', req.params.id), 'Задача'); if (!old) return
-  db.prepare('UPDATE tasks SET projectId=?,title=?,description=?,status=? WHERE id=?').run(req.body.projectId ?? old.projectId, req.body.title ?? old.title, req.body.description ?? old.description, req.body.status ?? old.status, req.params.id)
-  res.json(one('SELECT * FROM tasks WHERE id=?', req.params.id))
-}))
-app.delete('/api/tasks/:id', (req, res) => { const x = db.prepare('DELETE FROM tasks WHERE id=?').run(req.params.id); res.status(x.changes ? 204 : 404).end() })
 
-app.get('/api/tasks/:id/todos', (req, res) => res.json(db.prepare('SELECT id,taskId,text,checked FROM todos WHERE taskId=? ORDER BY id').all(req.params.id).map(x => ({ ...x, checked: !!x.checked }))))
-app.post('/api/tasks/:id/todos', safe((req, res) => { if (!req.body.text?.trim()) throw new Error('Введите текст'); const x = db.prepare('INSERT INTO todos(taskId,text) VALUES(?,?)').run(req.params.id, req.body.text.trim()); res.status(201).json({ ...one('SELECT * FROM todos WHERE id=?', x.lastInsertRowid), checked: false }) }))
-app.put('/api/tasks/:taskId/todos/:todoId', safe((req, res) => { const x = db.prepare('UPDATE todos SET text=COALESCE(?,text),checked=COALESCE(?,checked) WHERE id=? AND taskId=?').run(req.body.text ?? null, req.body.checked == null ? null : Number(req.body.checked), req.params.todoId, req.params.taskId); if (!x.changes) return res.status(404).json({ error: 'Пункт не найден' }); const row=one('SELECT * FROM todos WHERE id=?', req.params.todoId); res.json({...row,checked:!!row.checked}) }))
-app.delete('/api/tasks/:taskId/todos/:todoId', (req, res) => { const x=db.prepare('DELETE FROM todos WHERE id=? AND taskId=?').run(req.params.todoId,req.params.taskId); res.status(x.changes?204:404).end() })
-app.get('/api/tasks/:id/messages', (req, res) => res.json(db.prepare('SELECT * FROM messages WHERE taskId=? ORDER BY id').all(req.params.id)))
-app.post('/api/tasks/:id/messages', safe((req, res) => { if (!req.body.text?.trim()) throw new Error('Введите сообщение'); const x=db.prepare('INSERT INTO messages(taskId,author,text) VALUES(?,?,?)').run(req.params.id,req.user,req.body.text.trim()); res.status(201).json(one('SELECT * FROM messages WHERE id=?',x.lastInsertRowid)) }))
-app.delete('/api/tasks/:taskId/messages/:messageId', (req,res)=>{ const x=db.prepare('DELETE FROM messages WHERE id=? AND taskId=? AND author=?').run(req.params.messageId,req.params.taskId,req.user); res.status(x.changes?204:404).end() })
+app.get('/api/tasks/:id', (req, res) => {
+  const store = read()
+  const task = byId(store.tasks, req.params.id)
+  if (!task) return notFound(res, 'Задача')
+  res.json(task)
+})
+
+app.post('/api/tasks', safe((req, res) => {
+  const store = read()
+  const task = {
+    id: db.nextId(store, 'tasks'),
+    projectId: Number(req.body.projectId),
+    title: requiredText(req.body.title, 'Укажите проект и название'),
+    description: req.body.description || '',
+    status: ['active', 'paused', 'done'].includes(req.body.status) ? req.body.status : 'active',
+    createdAt: new Date().toISOString(),
+  }
+  if (!task.projectId || !byId(store.projects, task.projectId)) throw new Error('Укажите существующий проект')
+  store.tasks.push(task)
+  save(store)
+  res.status(201).json(task)
+}))
+
+app.put('/api/tasks/:id', safe((req, res) => {
+  const store = read()
+  const task = byId(store.tasks, req.params.id)
+  if (!task) return notFound(res, 'Задача')
+  if (req.body.projectId != null) {
+    const project = byId(store.projects, req.body.projectId)
+    if (!project) throw new Error('Укажите существующий проект')
+    task.projectId = Number(req.body.projectId)
+  }
+  if (req.body.title != null) task.title = requiredText(req.body.title, 'Укажите название')
+  if (req.body.description != null) task.description = req.body.description
+  if (req.body.status != null) task.status = ['active', 'paused', 'done'].includes(req.body.status) ? req.body.status : task.status
+  save(store)
+  res.json(task)
+}))
+
+app.delete('/api/tasks/:id', (req, res) => {
+  const store = read()
+  const ok = removeById(store.tasks, req.params.id)
+  if (!ok) return notFound(res, 'Задача')
+  store.todos = store.todos.filter((todo) => Number(todo.taskId) !== Number(req.params.id))
+  store.messages = store.messages.filter((message) => Number(message.taskId) !== Number(req.params.id))
+  save(store)
+  res.status(204).end()
+})
+
+app.get('/api/tasks/:id/todos', (req, res) => {
+  const store = read()
+  res.json(store.todos.filter((todo) => Number(todo.taskId) === Number(req.params.id)))
+})
+
+app.post('/api/tasks/:id/todos', safe((req, res) => {
+  const store = read()
+  if (!byId(store.tasks, req.params.id)) return notFound(res, 'Задача')
+  const todo = {
+    id: db.nextId(store, 'todos'),
+    taskId: Number(req.params.id),
+    text: requiredText(req.body.text, 'Введите текст'),
+    checked: false,
+  }
+  store.todos.push(todo)
+  save(store)
+  res.status(201).json(todo)
+}))
+
+app.put('/api/tasks/:taskId/todos/:todoId', safe((req, res) => {
+  const store = read()
+  const todo = store.todos.find((item) => Number(item.id) === Number(req.params.todoId) && Number(item.taskId) === Number(req.params.taskId))
+  if (!todo) return notFound(res, 'Пункт')
+  if (req.body.text != null) todo.text = requiredText(req.body.text, 'Введите текст')
+  if (req.body.checked != null) todo.checked = Boolean(req.body.checked)
+  save(store)
+  res.json(todo)
+}))
+
+app.delete('/api/tasks/:taskId/todos/:todoId', (req, res) => {
+  const store = read()
+  const before = store.todos.length
+  store.todos = store.todos.filter((todo) => !(Number(todo.id) === Number(req.params.todoId) && Number(todo.taskId) === Number(req.params.taskId)))
+  if (store.todos.length === before) return notFound(res, 'Пункт')
+  save(store)
+  res.status(204).end()
+})
+
+app.get('/api/tasks/:id/messages', (req, res) => {
+  const store = read()
+  res.json(store.messages.filter((message) => Number(message.taskId) === Number(req.params.id)).sort((a, b) => a.id - b.id))
+})
+
+app.post('/api/tasks/:id/messages', safe((req, res) => {
+  const store = read()
+  if (!byId(store.tasks, req.params.id)) return notFound(res, 'Задача')
+  const message = {
+    id: db.nextId(store, 'messages'),
+    taskId: Number(req.params.id),
+    author: req.user,
+    text: requiredText(req.body.text, 'Введите сообщение'),
+    timestamp: new Date().toISOString(),
+  }
+  store.messages.push(message)
+  save(store)
+  res.status(201).json(message)
+}))
+
+app.delete('/api/tasks/:taskId/messages/:messageId', (req, res) => {
+  const store = read()
+  const before = store.messages.length
+  store.messages = store.messages.filter((message) => !(Number(message.id) === Number(req.params.messageId) && Number(message.taskId) === Number(req.params.taskId) && message.author === req.user))
+  if (store.messages.length === before) return notFound(res, 'Сообщение')
+  save(store)
+  res.status(204).end()
+})
 
 app.use((req, res) => res.status(404).json({ error: 'Маршрут не найден' }))
+
 app.listen(port, () => console.log(`Neon CRM API: http://localhost:${port}`))

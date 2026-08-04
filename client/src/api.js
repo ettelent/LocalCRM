@@ -1,5 +1,5 @@
 import { router } from './main.js'
-const base = import.meta.env.VITE_API_URL || '/api'
+const base = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://localhost:3000/api' : '/api')
 export async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...options.headers }
   const token = localStorage.getItem('crm_token')
