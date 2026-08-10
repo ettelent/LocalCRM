@@ -7,6 +7,7 @@ import ClientPage from './views/ClientPage.vue'
 import ProjectPage from './views/ProjectPage.vue'
 import TaskPage from './views/TaskPage.vue'
 import PaymentSchedule from './views/PaymentSchedule.vue'
+import Tasks from './views/Tasks.vue'
 import './style.css'
 
 const routes = [
@@ -14,6 +15,7 @@ const routes = [
   { path: '/', component: Clients },
   { path: '/clients/:id', component: ClientPage },
   { path: '/projects/:id', component: ProjectPage },
+  { path: '/tasks', component: Tasks },
   { path: '/tasks/:id', component: TaskPage },
   { path: '/payment-schedule', component: PaymentSchedule }
 ]

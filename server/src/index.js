@@ -1,7 +1,9 @@
 import dotenv from 'dotenv'
 import express from 'express'
 import cors from 'cors'
-import { execute, initDb, query } from './db.js'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { databaseDriver, execute, initDb, query } from './db.js'
 
 dotenv.config({ path: new URL('../../.env', import.meta.url) })
 
@@ -34,6 +36,24 @@ app.use('/api', (req, res, next) => {
 })
 
 app.get('/api/me', (req, res) => res.json({ user: req.user }))
+
+app.get('/api/search', safe(async (req, res) => {
+  const term = String(req.query.q || '').trim()
+  if (term.length < 2) return res.json([])
+  const like = `%${term}%`
+  const [clients, projects, tasks, messages] = await Promise.all([
+    query('SELECT id,name,contactInfo FROM clients WHERE name LIKE ? OR contactInfo LIKE ? OR notes LIKE ? ORDER BY id DESC LIMIT 6', [like, like, like]),
+    query('SELECT p.id,p.title,c.name AS clientName FROM projects p JOIN clients c ON c.id=p.clientId WHERE p.title LIKE ? OR p.description LIKE ? ORDER BY p.id DESC LIMIT 6', [like, like]),
+    query('SELECT t.id,t.title,p.title AS projectTitle FROM tasks t JOIN projects p ON p.id=t.projectId WHERE t.title LIKE ? OR t.description LIKE ? ORDER BY t.id DESC LIMIT 6', [like, like]),
+    query('SELECT m.id,m.taskId,m.text,t.title AS taskTitle FROM messages m JOIN tasks t ON t.id=m.taskId WHERE m.text LIKE ? ORDER BY m.id DESC LIMIT 6', [like])
+  ])
+  res.json([
+    ...clients.map(x => ({ type: 'client', id: x.id, title: x.name, subtitle: x.contactInfo, path: `/clients/${x.id}` })),
+    ...projects.map(x => ({ type: 'project', id: x.id, title: x.title, subtitle: x.clientName, path: `/projects/${x.id}` })),
+    ...tasks.map(x => ({ type: 'task', id: x.id, title: x.title, subtitle: x.projectTitle, path: `/tasks/${x.id}` })),
+    ...messages.map(x => ({ type: 'message', id: x.id, title: x.text, subtitle: x.taskTitle, path: `/tasks/${x.taskId}` }))
+  ])
+}))
 
 app.get('/api/clients', safe(async (req, res) => res.json(await query('SELECT * FROM clients ORDER BY id DESC'))))
 app.get('/api/clients/:id', safe(async (req, res) => { const row = await one('SELECT * FROM clients WHERE id=?', [req.params.id]); if (row) res.json(row); else required(res, row, 'Клиент') }))
@@ -78,21 +98,28 @@ app.put('/api/projects/:id', safe(async (req, res) => {
 app.delete('/api/projects/:id', safe(async (req, res) => { const result = await execute('DELETE FROM projects WHERE id=?', [req.params.id]); res.status(result.affectedRows ? 204 : 404).end() }))
 
 app.get('/api/tasks', safe(async (req, res) => {
+  const sql = `SELECT t.*,p.title AS projectTitle,c.id AS clientId,c.name AS clientName
+    FROM tasks t JOIN projects p ON p.id=t.projectId JOIN clients c ON c.id=p.clientId`
   const rows = req.query.projectId
-    ? await query('SELECT * FROM tasks WHERE projectId=? ORDER BY id DESC', [req.query.projectId])
-    : await query('SELECT * FROM tasks ORDER BY id DESC')
+    ? await query(`${sql} WHERE t.projectId=? ORDER BY t.id DESC`, [req.query.projectId])
+    : await query(`${sql} ORDER BY t.id DESC`)
   res.json(rows)
 }))
-app.get('/api/tasks/:id', safe(async (req, res) => { const row = await one('SELECT * FROM tasks WHERE id=?', [req.params.id]); if (row) res.json(row); else required(res, row, 'Задача') }))
+app.get('/api/tasks/:id', safe(async (req, res) => { const row = await one('SELECT t.*,p.title AS projectTitle,c.id AS clientId,c.name AS clientName FROM tasks t JOIN projects p ON p.id=t.projectId JOIN clients c ON c.id=p.clientId WHERE t.id=?', [req.params.id]); if (row) res.json(row); else required(res, row, 'Задача') }))
 app.post('/api/tasks', safe(async (req, res) => {
   if (!req.body.title?.trim() || !req.body.projectId) throw new Error('Укажите проект и название')
-  const result = await execute('INSERT INTO tasks(projectId,title,description,status) VALUES(?,?,?,?)', [req.body.projectId, req.body.title.trim(), req.body.description || '', req.body.status || 'active'])
+  const status = taskStatus(req.body.status)
+  const assignee = taskAssignee(req.body.assignee)
+  const priority = taskPriority(req.body.priority)
+  const result = await execute('INSERT INTO tasks(projectId,title,description,status,assignee,priority,dueDate,completedAt) VALUES(?,?,?,?,?,?,?,?)', [req.body.projectId, req.body.title.trim(), req.body.description || '', status, assignee, priority, req.body.dueDate || null, status === 'done' ? sqlNow() : null])
   res.status(201).json(await one('SELECT * FROM tasks WHERE id=?', [result.insertId]))
 }))
 app.put('/api/tasks/:id', safe(async (req, res) => {
   const old = await one('SELECT * FROM tasks WHERE id=?', [req.params.id])
   if (!old) return required(res, old, 'Задача')
-  await execute('UPDATE tasks SET projectId=?,title=?,description=?,status=? WHERE id=?', [req.body.projectId ?? old.projectId, req.body.title ?? old.title, req.body.description ?? old.description, req.body.status ?? old.status, req.params.id])
+  const status = taskStatus(req.body.status ?? old.status)
+  const completedAt = status === 'done' ? (old.completedAt || sqlNow()) : null
+  await execute('UPDATE tasks SET projectId=?,title=?,description=?,status=?,assignee=?,priority=?,dueDate=?,completedAt=? WHERE id=?', [req.body.projectId ?? old.projectId, req.body.title ?? old.title, req.body.description ?? old.description, status, taskAssignee(req.body.assignee ?? old.assignee), taskPriority(req.body.priority ?? old.priority), req.body.dueDate === undefined ? old.dueDate : (req.body.dueDate || null), completedAt, req.params.id])
   res.json(await one('SELECT * FROM tasks WHERE id=?', [req.params.id]))
 }))
 app.delete('/api/tasks/:id', safe(async (req, res) => { const result = await execute('DELETE FROM tasks WHERE id=?', [req.params.id]); res.status(result.affectedRows ? 204 : 404).end() }))
@@ -128,11 +155,7 @@ app.get('/api/payment-schedules', safe(async (req, res) => {
     JOIN clients c ON c.id = ps.clientId
     ORDER BY ps.paymentDate DESC, ps.id DESC
   `)
-  res.json(rows.map(row => ({
-    ...row,
-    projectIds: safeParseIds(row.projectIds),
-    dueInDays: calcDueInDays(row.paymentDate)
-  })))
+  res.json(rows.map(paymentDto))
 }))
 app.get('/api/payment-schedules/:id', safe(async (req, res) => {
   const row = await one(`
@@ -141,7 +164,7 @@ app.get('/api/payment-schedules/:id', safe(async (req, res) => {
     JOIN clients c ON c.id = ps.clientId
     WHERE ps.id=?
   `, [req.params.id])
-  if (row) res.json({ ...row, projectIds: safeParseIds(row.projectIds), dueInDays: calcDueInDays(row.paymentDate) })
+  if (row) res.json(paymentDto(row))
   else required(res, row, 'Запись оплаты')
 }))
 app.post('/api/payment-schedules', safe(async (req, res) => {
@@ -150,10 +173,12 @@ app.post('/api/payment-schedules', safe(async (req, res) => {
   if (!Array.isArray(req.body.projectIds) || !req.body.projectIds.length) throw new Error('Выберите хотя бы один проект')
   if (!Number.isFinite(amount) || amount <= 0) throw new Error('Укажите сумму')
   if (!req.body.paymentDate) throw new Error('Укажите дату оплаты')
+  await validatePaymentProjects(req.body.clientId, req.body.projectIds)
   const dueInDays = calcDueInDays(req.body.paymentDate)
+  const status = paymentStatus(req.body.status)
   const result = await execute(
-    'INSERT INTO payment_schedules(clientId,projectIds,amount,paymentDate,dueInDays) VALUES(?,?,?,?,?)',
-    [req.body.clientId, JSON.stringify(req.body.projectIds.map(Number)), amount, req.body.paymentDate, dueInDays]
+    'INSERT INTO payment_schedules(clientId,projectIds,amount,paymentDate,dueInDays,status,paidDate,paymentMethod,comment) VALUES(?,?,?,?,?,?,?,?,?)',
+    [req.body.clientId, JSON.stringify(req.body.projectIds.map(Number)), amount, req.body.paymentDate, dueInDays, status, status === 'paid' ? (req.body.paidDate || dateToday()) : null, req.body.paymentMethod || '', req.body.comment || '']
   )
   const row = await one(`
     SELECT ps.*, c.name AS clientName
@@ -161,7 +186,7 @@ app.post('/api/payment-schedules', safe(async (req, res) => {
     JOIN clients c ON c.id = ps.clientId
     WHERE ps.id=?
   `, [result.insertId])
-  res.status(201).json({ ...row, projectIds: safeParseIds(row.projectIds), dueInDays: calcDueInDays(row.paymentDate) })
+  res.status(201).json(paymentDto(row))
 }))
 app.put('/api/payment-schedules/:id', safe(async (req, res) => {
   const old = await one('SELECT * FROM payment_schedules WHERE id=?', [req.params.id])
@@ -171,9 +196,13 @@ app.put('/api/payment-schedules/:id', safe(async (req, res) => {
   if (!Array.isArray(projectIds) || !projectIds.length) throw new Error('Выберите хотя бы один проект')
   const paymentDate = req.body.paymentDate ?? old.paymentDate
   const dueInDays = calcDueInDays(paymentDate)
+  const clientId = req.body.clientId ?? old.clientId
+  const status = paymentStatus(req.body.status ?? old.status)
+  await validatePaymentProjects(clientId, projectIds)
+  const paidDate = status === 'paid' ? (req.body.paidDate || old.paidDate || dateToday()) : null
   await execute(
-    'UPDATE payment_schedules SET clientId=?,projectIds=?,amount=?,paymentDate=?,dueInDays=? WHERE id=?',
-    [req.body.clientId ?? old.clientId, JSON.stringify(projectIds.map(Number)), amount, paymentDate, dueInDays, req.params.id]
+    'UPDATE payment_schedules SET clientId=?,projectIds=?,amount=?,paymentDate=?,dueInDays=?,status=?,paidDate=?,paymentMethod=?,comment=? WHERE id=?',
+    [clientId, JSON.stringify(projectIds.map(Number)), amount, paymentDate, dueInDays, status, paidDate, req.body.paymentMethod ?? old.paymentMethod, req.body.comment ?? old.comment, req.params.id]
   )
   const row = await one(`
     SELECT ps.*, c.name AS clientName
@@ -181,7 +210,7 @@ app.put('/api/payment-schedules/:id', safe(async (req, res) => {
     JOIN clients c ON c.id = ps.clientId
     WHERE ps.id=?
   `, [req.params.id])
-  res.json({ ...row, projectIds: safeParseIds(row.projectIds), dueInDays: calcDueInDays(row.paymentDate) })
+  res.json(paymentDto(row))
 }))
 app.delete('/api/payment-schedules/:id', safe(async (req, res) => { const result = await execute('DELETE FROM payment_schedules WHERE id=?', [req.params.id]); res.status(result.affectedRows ? 204 : 404).end() }))
 
@@ -205,5 +234,58 @@ function calcDueInDays(paymentDate) {
   return Math.max(0, Math.round((payment.getTime() - utcToday) / 86400000))
 }
 
+function dateToday() {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function sqlNow() {
+  return new Date().toISOString().slice(0, 19).replace('T', ' ')
+}
+
+function taskStatus(value) {
+  if (!['active', 'paused', 'done'].includes(value)) throw new Error('Некорректный статус задачи')
+  return value
+}
+
+function taskAssignee(value = '') {
+  if (!['', 'Lesha', 'Denis'].includes(value)) throw new Error('Некорректный исполнитель')
+  return value
+}
+
+function taskPriority(value = 'normal') {
+  if (!['low', 'normal', 'high', 'urgent'].includes(value)) throw new Error('Некорректный приоритет')
+  return value
+}
+
+function paymentStatus(value = 'planned') {
+  if (!['planned', 'paid', 'cancelled'].includes(value)) throw new Error('Некорректный статус оплаты')
+  return value
+}
+
+async function validatePaymentProjects(clientId, projectIds) {
+  const normalized = [...new Set(projectIds.map(Number).filter(Number.isInteger))]
+  if (!normalized.length || normalized.length !== projectIds.length) throw new Error('Некорректный список проектов')
+  const placeholders = normalized.map(() => '?').join(',')
+  const rows = await query(`SELECT id FROM projects WHERE clientId=? AND id IN (${placeholders})`, [clientId, ...normalized])
+  if (rows.length !== normalized.length) throw new Error('Проекты должны принадлежать выбранному клиенту')
+}
+
+function paymentDto(row) {
+  const dueInDays = calcDueInDays(row.paymentDate)
+  const overdue = row.status === 'planned' && dueInDays === 0 && String(row.paymentDate).slice(0, 10) < dateToday()
+  return {
+    ...row,
+    projectIds: safeParseIds(row.projectIds),
+    dueInDays,
+    displayStatus: overdue ? 'overdue' : row.status
+  }
+}
+
+const clientDist = fileURLToPath(new URL('../../client/dist', import.meta.url))
+if (process.env.SERVE_CLIENT === 'true' && existsSync(clientDist)) {
+  app.use(express.static(clientDist))
+  app.get(/^(?!\/api(?:\/|$)).*/, (req, res) => res.sendFile(`${clientDist}/index.html`))
+}
+
 app.use((req, res) => res.status(404).json({ error: 'Маршрут не найден' }))
-app.listen(port, () => console.log(`Neon CRM API: http://localhost:${port}`))
+app.listen(port, () => console.log(`Neon CRM API: http://localhost:${port} (${databaseDriver()})`))

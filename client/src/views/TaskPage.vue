@@ -14,7 +14,7 @@ const todos = ref([])
 const todoText = ref('')
 const editing = ref(false)
 const error = ref('')
-const form = ref({ title: '', description: '', status: 'active' })
+const form = ref({ title: '', description: '', status: 'active', assignee: '', priority: 'normal', dueDate: '' })
 const sendingTodo = ref(false)
 const currentUser = computed(() => localStorage.getItem('crm_user') || '')
 
@@ -86,6 +86,9 @@ function editTask() {
     title: task.value.title || '',
     description: task.value.description || '',
     status: task.value.status || 'active',
+    assignee: task.value.assignee || '',
+    priority: task.value.priority || 'normal',
+    dueDate: task.value.dueDate ? String(task.value.dueDate).slice(0, 10) : '',
   }
   editing.value = true
 }
@@ -125,6 +128,11 @@ onUnmounted(() => {
           <StatusBadge :status="task.status" />
         </div>
         <p>{{ task.description || 'Описание не добавлено' }}</p>
+        <div class="task-meta">
+          <span>Исполнитель: <b>{{ task.assignee || 'не назначен' }}</b></span>
+          <span>Приоритет: <b>{{ {low:'низкий',normal:'обычный',high:'высокий',urgent:'срочный'}[task.priority] || 'обычный' }}</b></span>
+          <span>Срок: <b>{{ task.dueDate ? new Date(task.dueDate).toLocaleDateString('ru-RU') : 'не указан' }}</b></span>
+        </div>
       </div>
       <button class="ghost" type="button" @click="editTask">Редактировать</button>
     </header>
@@ -162,6 +170,9 @@ onUnmounted(() => {
     <ModalForm v-if="editing" title="Редактировать задачу" @close="editing = false" @submit="saveTask">
       <label>Название<input v-model="form.title" required></label>
       <label>Описание<textarea v-model="form.description"></textarea></label>
+      <label>Исполнитель<select v-model="form.assignee"><option value="">Не назначен</option><option value="Lesha">Lesha</option><option value="Denis">Denis</option></select></label>
+      <label>Приоритет<select v-model="form.priority"><option value="low">Низкий</option><option value="normal">Обычный</option><option value="high">Высокий</option><option value="urgent">Срочный</option></select></label>
+      <label>Крайний срок<input v-model="form.dueDate" type="date"></label>
       <label>
         Статус
         <select v-model="form.status">
