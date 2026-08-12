@@ -1,15 +1,13 @@
 import dotenv from 'dotenv'
 import express from 'express'
 import cors from 'cors'
-import { existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { databaseDriver, execute, initDb, query } from './db.js'
+import { execute, initDb, query } from './db.js'
 
 dotenv.config({ path: new URL('../../.env', import.meta.url) })
 
 const app = express()
 const port = Number(process.env.PORT || 3000)
-const origins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://localhost:8080').split(',')
+const origins = (process.env.CLIENT_ORIGIN || 'http://localhost:8080').split(',')
 
 app.use(cors({ origin: origins }))
 app.use(express.json())
@@ -281,11 +279,5 @@ function paymentDto(row) {
   }
 }
 
-const clientDist = fileURLToPath(new URL('../../client/dist', import.meta.url))
-if (process.env.SERVE_CLIENT === 'true' && existsSync(clientDist)) {
-  app.use(express.static(clientDist))
-  app.get(/^(?!\/api(?:\/|$)).*/, (req, res) => res.sendFile(`${clientDist}/index.html`))
-}
-
 app.use((req, res) => res.status(404).json({ error: 'Маршрут не найден' }))
-app.listen(port, () => console.log(`Neon CRM API: http://localhost:${port} (${databaseDriver()})`))
+app.listen(port, () => console.log(`Neon CRM API: http://localhost:${port}`))

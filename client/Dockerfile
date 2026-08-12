@@ -1,7 +1,9 @@
 FROM node:22-alpine AS build
 WORKDIR /app
+ENV NODE_OPTIONS=--dns-result-order=ipv4first \
+    NPM_CONFIG_MAXSOCKETS=1
 COPY package*.json ./
-RUN npm install
+RUN npm ci --no-audit --no-fund --fetch-retries=10 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=10000
 COPY . .
 RUN npm run build
 FROM nginx:1.27-alpine
